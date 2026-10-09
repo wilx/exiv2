@@ -643,6 +643,8 @@ constexpr TagInfo OlympusMakerNote::tagInfoCs_[] = {
      unsignedShort, -1, EXV_PRINT_TAG(olympusOffOn)},
     {0x0904, "LevelGaugePitch", N_("Level Gauge Pitch"), N_("Level gauge pitch"), IfdId::olympusCsId,
      SectionId::makerTags, unsignedShort, -1, EXV_PRINT_TAG(olympusOffOn)},
+    {0x0908, "DateTimeUTC", N_("Date Time UTC"), N_("Date and time in UTC"), IfdId::olympusId, SectionId::makerTags,
+     asciiString, -1, printValue},
     // End of list marker
     {0xffff, "(UnknownOlympusCsTag)", "(UnknownOlympusCsTag)", N_("Unknown OlympusCs tag"), IfdId::olympusCsId,
      SectionId::makerTags, asciiString, -1, printValue},
