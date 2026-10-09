@@ -347,7 +347,7 @@ constexpr TagDetails olympusMacroMode[] = {
 //! FocusMode, tag 0x0301
 [[maybe_unused]] constexpr TagDetails olympusCsFocusMode[] = {
     {0, N_("Single AF")}, {1, N_("Sequential shooting AF")}, {2, N_("Continuous AF")}, {3, N_("Multi AF")},
-    {10, N_("MF")},
+    {4, N_("Face Detect")}, {10, N_("MF")},
 };
 
 //! FocusProcess, tag 0x0302
@@ -459,6 +459,8 @@ constexpr TagDetails olympusPictureMode[] = {
     {12, N_("Monochrome Profile 1")},
     {13, N_("Monochrome Profile 2")},
     {14, N_("Monochrome Profile 3")},
+    {17, N_("Art Mode")},
+    {18, N_("Monochrome Profile 4")},
     {256, N_("Monotone")},
     {512, N_("Sepia")},
 };
@@ -481,6 +483,7 @@ constexpr TagDetails artFilters[] = {
     {4, N_("Light Tone")},
     {5, N_("Pin Hole")},
     {6, N_("Grainy Film")},
+    {8, N_("Underwater")},
     {9, N_("Diorama")},
     {10, N_("Cross Process")},
     {12, N_("Fish Eye")},
@@ -512,6 +515,9 @@ constexpr TagDetails artFilters[] = {
     {39, N_("Partial Color")},
     {40, N_("Partial Color II")},
     {41, N_("Partial Color III")},
+    {42, N_("Bleach Bypass")},
+    {43, N_("Bleach Bypass II")},
+    {44, N_("Instant Film")},
 };
 
 //! OlympusCs Quality, tag 0x0603
@@ -520,11 +526,12 @@ constexpr TagDetails olympusCsQuality[] = {
     {2, N_("HQ")},
     {3, N_("SHQ")},
     {4, N_("RAW")},
+    {5, N_("SQ (5)")},
 };
 
 //! Olympus ImageStabilization, tag 0x0604
 static constexpr TagDetails olympusImageStabilization[] = {
-    {0, N_("Off")}, {1, N_("S-IS 1")}, {2, N_("S-IS 2")}, {3, N_("S-IS 3")}, {4, N_("S-IS AUTO")},
+    {0, N_("Off")}, {1, N_("S-IS 1")}, {2, N_("S-IS 2")}, {3, N_("S-IS 3")}, {4, N_("S-IS Auto")},
 };
 
 constexpr TagInfo OlympusMakerNote::tagInfoCs_[] = {
