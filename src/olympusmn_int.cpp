@@ -534,6 +534,20 @@ static constexpr TagDetails olympusImageStabilization[] = {
     {0, N_("Off")}, {1, N_("S-IS 1")}, {2, N_("S-IS 2")}, {3, N_("S-IS 3")}, {4, N_("S-IS Auto")},
 };
 
+//! Olympus ImageStabilization, tag 0x0804
+static constexpr TagDetails olympusStackedImage[] = {
+    {0, N_("No")},
+    {1, N_("Live Composite")},
+    {3, N_("ND")},
+    {4, N_("Live Time/Bulb")},
+    {5, N_("HDR1")},
+    {6, N_("HDR2")},
+    {8, N_("Tripod high resolution")},
+    {9, N_("Focus-stacked")},
+    {11, N_("Hand-held high resolution")},
+    {13, N_("GND")},
+};
+
 constexpr TagInfo OlympusMakerNote::tagInfoCs_[] = {
     {0x0000, "CameraSettingsVersion", N_("Camera Settings Version"), N_("Camera settings version"), IfdId::olympusCsId,
      SectionId::makerTags, undefined, -1, printExifVersion},
@@ -633,6 +647,8 @@ constexpr TagInfo OlympusMakerNote::tagInfoCs_[] = {
      unsignedShort, -1, EXV_PRINT_TAG(olympusCsQuality)},
     {0x0604, "ImageStabilization", N_("Image Stabilization"), N_("Image stabilization"), IfdId::olympusCsId,
      SectionId::makerTags, unsignedLong, -1, EXV_PRINT_TAG(olympusImageStabilization)},
+    {0x0804, "StackedImage", N_("Stacked Image"), N_("Stacked image"), IfdId::olympusCsId, SectionId::makerTags,
+     unsignedLong, -1, EXV_PRINT_TAG(olympusStackedImage)},
     {0x0900, "ManometerPressure", N_("Manometer Pressure"), N_("Manometer pressure"), IfdId::olympusCsId,
      SectionId::makerTags, unsignedShort, -1, printValue},
     {0x0901, "ManometerReading", N_("Manometer Reading"), N_("Manometer reading"), IfdId::olympusCsId,
