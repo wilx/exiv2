@@ -862,6 +862,85 @@ TEST_F(XmpFileWrite, WindowsCleansPrivateTemporaryWithoutParentDeleteChild) {
   EXPECT_EQ(original, windowsSecurity(target));
 }
 
+TEST_F(XmpFileWrite, WindowsRejectsDaclDeniedWritesAndAllowsRetry) {
+  if (!windowsAclsSupported(directory)) {
+    GTEST_SKIP() << "Filesystem does not support persistent Windows ACLs";
+  }
+  const auto sid = windowsUserSid();
+  for (const bool explicitDeny : {false, true}) {
+    for (const bool staged : {false, true}) {
+      SCOPED_TRACE(testing::Message() << "explicit deny=" << explicitDeny << ", deferred=" << staged);
+      {
+        auto original = ImageFactory::create(ImageType::xmp, target.string());
+        raw(*original, "original-canary");
+        original->writeMetadata();
+      }
+      // Permit reading, READ_CONTROL and DELETE, but not file-data writes.
+      // Denying GENERIC_WRITE would also deny SYNCHRONIZE needed by readers.
+      setWindowsDacl(target,
+                     "D:P" + std::string(explicitDeny ? "(D;;0x2;;;" + sid + ")" : "") + "(A;;0x130089;;;" + sid + ")");
+      const auto before = contents(target);
+      const auto security = windowsSecurity(target);
+      const auto attributes = GetFileAttributesW(target.c_str());
+      ASSERT_NE(INVALID_FILE_ATTRIBUTES, attributes);
+      ASSERT_EQ(0U, attributes & FILE_ATTRIBUTE_READONLY);
+      {
+        const auto handle = CreateFileW(target.c_str(), GENERIC_READ | READ_CONTROL | DELETE,
+                                        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
+                                        FILE_ATTRIBUTE_NORMAL, nullptr);
+        ASSERT_NE(INVALID_HANDLE_VALUE, handle);
+        const WindowsHandle allowed(handle);
+      }
+      const auto handle =
+          CreateFileW(target.c_str(), FILE_WRITE_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
+                      OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+      const auto error = GetLastError();
+      const WindowsHandle denied(handle == INVALID_HANDLE_VALUE ? nullptr : handle);
+      ASSERT_EQ(INVALID_HANDLE_VALUE, handle);
+      ASSERT_EQ(ERROR_ACCESS_DENIED, error);
+
+      auto image = staged ? deferred() : ImageFactory::open(target.string());
+      raw(*image, "replacement");
+      const auto packet = image->xmpPacket();
+      EXPECT_THROW(image->writeMetadata(), Error);
+      EXPECT_EQ(before, contents(target));
+      EXPECT_EQ(security, windowsSecurity(target));
+      EXPECT_EQ(1U, files());
+
+      setWindowsDacl(target, "D:P(A;;FA;;;" + sid + ")");
+      const auto writableSecurity = windowsSecurity(target);
+      ASSERT_NO_THROW(image->writeMetadata());
+      EXPECT_EQ(packet, contents(target));
+      EXPECT_EQ(writableSecurity, windowsSecurity(target));
+      EXPECT_EQ(1U, files());
+    }
+  }
+}
+
+TEST_F(XmpFileWrite, WindowsChecksWriteAccessBeforeCreatingTemporary) {
+  if (!windowsAclsSupported(directory)) {
+    GTEST_SKIP() << "Filesystem does not support persistent Windows ACLs";
+  }
+  seed();
+  setWindowsDacl(target, "D:P(A;;0x130089;;;" + windowsUserSid() + ")");
+  const auto security = windowsSecurity(target);
+  struct CountCreation : Internal::XmpFileOps {
+    mutable unsigned creations = 0;
+
+    int create(const fs::path& path, bool replacement) const override {
+      ++creations;
+      return XmpFileOps::create(path, replacement);
+    }
+  } ops;
+  const std::string packet = "new private packet";
+  MemIo source(reinterpret_cast<const byte*>(packet.data()), packet.size());
+  EXPECT_THROW(Internal::replaceXmpFile(target.string(), source, ops), Error);
+  EXPECT_EQ(0U, ops.creations);
+  EXPECT_EQ("original-canary", contents(target));
+  EXPECT_EQ(security, windowsSecurity(target));
+  EXPECT_EQ(1U, files());
+}
+
 // Windows must preserve the old file when sharing or read-only attributes deny replacement.
 TEST_F(XmpFileWrite, PreservesReadOnlyAndLockedDestinations) {
   seed();

@@ -181,7 +181,9 @@ struct FilePermissions {
         (attributes & FILE_ATTRIBUTE_READONLY)) {
       throw Error(ErrorCode::kerImageWriteFailed);
     }
-    WindowsHandle original(CreateFileW(target.c_str(), READ_CONTROL,
+    // Check effective write access without truncating the destination. A copied
+    // DACL does not revoke write access on the temporary's already-open handle.
+    WindowsHandle original(CreateFileW(target.c_str(), GENERIC_WRITE | READ_CONTROL,
                                        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
                                        FILE_ATTRIBUTE_NORMAL, nullptr));
     if (original.get() == INVALID_HANDLE_VALUE) {
