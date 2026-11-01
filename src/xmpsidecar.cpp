@@ -106,6 +106,12 @@ static bool matchi(const std::string& key, const char* substr) {
 }
 
 void XmpSidecar::writeMetadata() {
+#if defined(EXV_ENABLE_FILESYSTEM) && !defined(EXV_HAVE_XMP_TOOLKIT)
+  // Without the toolkit Image always selects packet writes. Do not silently
+  // discard structured input supplied to the opt-in deferred API.
+  if (Internal::isDeferredXmpIo(*io_) && (!xmpData_.empty() || !exifData_.empty() || !iptcData_.empty()))
+    throw Error(ErrorCode::kerImageWriteFailed);
+#endif
   if (io_->open() != 0) {
     throw Error(ErrorCode::kerDataSourceOpenFailed, io_->path(), strError());
   }
@@ -160,6 +166,11 @@ void XmpSidecar::writeMetadata() {
       throw Error(ErrorCode::kerImageWriteFailed);
     }
   }
+#ifdef EXV_ENABLE_FILESYSTEM
+  // An explicitly empty deferred write publishes the legacy empty sidecar.
+  if (packet.empty() && Internal::isUncommittedXmpIo(*io_))
+    packet = xmlHeader;
+#endif
   if (!packet.empty()) {
     if (!packet.starts_with("<?xml") && !packet.starts_with("<?xpacket")) {
       packet = xmlHeader + packet + xmlFooter;

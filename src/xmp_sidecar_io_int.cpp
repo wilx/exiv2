@@ -158,5 +158,95 @@ void replaceXmpFile(const std::string& path, BasicIo& source, const XmpFileOps& 
     throw Error(ErrorCode::kerImageWriteFailed);
   }
 }
+namespace {
+// Present an empty image until the first successful filesystem commit.
+class DeferredXmpIo final : public BasicIo {
+ public:
+  explicit DeferredXmpIo(std::string path) : path_(std::move(path)), current_(std::make_unique<MemIo>()) {
+  }
+  int open() override {
+    return current_->open();
+  }
+  int close() override {
+    return current_->close();
+  }
+  size_t write(const byte* data, size_t size) override {
+    return current_->write(data, size);
+  }
+  size_t write(BasicIo& source) override {
+    return current_->write(source);
+  }
+  int putb(byte value) override {
+    return current_->putb(value);
+  }
+  DataBuf read(size_t size) override {
+    return current_->read(size);
+  }
+  size_t read(byte* data, size_t size) override {
+    return current_->read(data, size);
+  }
+  int getb() override {
+    return current_->getb();
+  }
+  int seek(int64_t offset, Position position) override {
+    return current_->seek(offset, position);
+  }
+  byte* mmap(bool writable) override {
+    return current_->mmap(writable);
+  }
+  int munmap() override {
+    return current_->munmap();
+  }
+  size_t tell() const override {
+    return current_->tell();
+  }
+  size_t size() const override {
+    return current_->size();
+  }
+  bool isopen() const override {
+    return current_->isopen();
+  }
+  int error() const override {
+    return current_->error();
+  }
+  bool eof() const override {
+    return current_->eof();
+  }
+  const std::string& path() const noexcept override {
+    return path_;
+  }
+  void populateFakeData() override {
+    current_->populateFakeData();
+  }
+  void transfer(BasicIo& source) override {
+    // Allocate before commit: nothing after publication is allowed to fail.
+    auto file = std::make_unique<FileIo>(path_);
+    replaceXmpFile(path_, source);
+    current_ = std::move(file);
+    committed_ = true;
+  }
+  bool committed() const {
+    return committed_;
+  }
+
+ private:
+  std::string path_;
+  BasicIo::UniquePtr current_;
+  bool committed_{};
+};
+}  // namespace
+
+BasicIo::UniquePtr deferredXmpIo(const std::string& path) {
+  return std::make_unique<DeferredXmpIo>(path);
+}
+
+bool isUncommittedXmpIo(const BasicIo& io) {
+  const auto* deferred = dynamic_cast<const DeferredXmpIo*>(&io);
+  return deferred && !deferred->committed();
+}
+
+bool isDeferredXmpIo(const BasicIo& io) {
+  return dynamic_cast<const DeferredXmpIo*>(&io) != nullptr;
+}
 }  // namespace Exiv2::Internal
 #endif

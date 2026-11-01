@@ -18,6 +18,8 @@
 // namespace extensions
 namespace Exiv2 {
 class BasicIo;
+//! Select when a factory-created image is written to its destination.
+enum class CreateMode { immediate, deferred };
 // *****************************************************************************
 // class definitions
 
@@ -621,6 +623,23 @@ class EXIV2API ImageFactory {
     @throw Error If the image type is not supported.
    */
   static Image::UniquePtr create(ImageType type, const std::string& path);
+  /*!
+    @brief Create an image immediately or stage an XMP sidecar until writing succeeds.
+    Deferred mode supports only ImageType::xmp. The returned object represents a
+    new empty sidecar, even when path exists. readMetadata() reads that empty
+    state until the first successful writeMetadata(). Before then, an existing
+    file is unchanged and a missing file stays absent, including on destruction.
+    Permission and other filesystem errors can consequently occur at write time.
+    Successful writes replace the destination rather than merging its metadata.
+    io().path() reports path; direct I/O is not a transactional write interface.
+    Without the XMP toolkit, deferred writes support only raw packets or empty
+    sidecars and reject nonempty structured Exif, IPTC or XMP containers.
+    @param type Image type; only XMP supports deferred creation.
+    @param path Destination filename.
+    @param mode Immediate creation or deferred publication.
+    @throw Error If deferred creation is requested for an unsupported type.
+   */
+  static Image::UniquePtr create(ImageType type, const std::string& path, CreateMode mode);
   /*!
     @brief Create an Image subclass of the requested type by creating a
         new image in memory.

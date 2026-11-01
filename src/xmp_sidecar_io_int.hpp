@@ -20,6 +20,9 @@ struct XmpFileOps {
 
 // Publish only complete output. No operation after replacement may throw.
 void replaceXmpFile(const std::string& path, BasicIo& source, const XmpFileOps& ops = XmpFileOps{});
+BasicIo::UniquePtr deferredXmpIo(const std::string& path);
+bool isDeferredXmpIo(const BasicIo& io);
+bool isUncommittedXmpIo(const BasicIo& io);
 }  // namespace Exiv2::Internal
 #endif
 #endif

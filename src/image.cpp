@@ -11,6 +11,7 @@
 #include "image_int.hpp"
 #include "safe_op.hpp"
 #include "slice.hpp"
+#include "xmp_sidecar_io_int.hpp"
 
 #ifdef EXV_ENABLE_BMFF
 #include "bmffimage.hpp"
@@ -894,6 +895,14 @@ Image::UniquePtr ImageFactory::open(BasicIo::UniquePtr io) {
 }
 
 #ifdef EXV_ENABLE_FILESYSTEM
+Image::UniquePtr ImageFactory::create(ImageType type, const std::string& path, CreateMode mode) {
+  if (mode == CreateMode::immediate)
+    return create(type, path);
+  if (mode != CreateMode::deferred || type != ImageType::xmp)
+    throw Error(ErrorCode::kerUnsupportedImageType, static_cast<int>(type));
+  return create(type, Internal::deferredXmpIo(path));
+}
+
 Image::UniquePtr ImageFactory::create(ImageType type, const std::string& path) {
   auto fileIo = std::make_unique<FileIo>(path);
   // Create or overwrite the file, then close it
