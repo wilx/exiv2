@@ -64,7 +64,7 @@ bool appendText(Blob& bytes, std::string_view text, ByteOrder order) {
       return false;
     while (continuation > 0) {
       --continuation;
-      const auto next = static_cast<byte>(text[pos++]);
+      const auto next = static_cast<byte>(text.at(pos++));
       if ((next & 0xc0) != 0x80)
         return false;
       unit = (unit << 6) | (next & 0x3f);
