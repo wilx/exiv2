@@ -8,7 +8,9 @@
 #ifdef EXV_ENABLE_FILESYSTEM
 #include <cstdio>
 #include <filesystem>
-#ifndef _WIN32
+#ifdef _WIN32
+#include <vector>
+#else
 #include <sys/types.h>
 #ifdef EXV_HAVE_POSIX_ACL
 #include <sys/acl.h>
@@ -30,7 +32,9 @@ using XmpAcl = std::unique_ptr<std::remove_pointer_t<acl_t>, XmpAclDeleter>;
 struct XmpFileOps {
   virtual ~XmpFileOps() = default;
   virtual int create(const std::filesystem::path& path, bool replacement) const;
-#ifndef _WIN32
+#ifdef _WIN32
+  virtual void setSecurity(int fd, const std::filesystem::path& path, const std::vector<byte>& descriptor) const;
+#else
 #ifdef EXV_HAVE_POSIX_ACL
   virtual XmpAcl readAcl(int fd) const;
   virtual bool writeAcl(int fd, const XmpAcl& acl) const;

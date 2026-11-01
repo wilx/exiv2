@@ -1,15 +1,21 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 #include <gtest/gtest.h>
 #include <algorithm>
+#include <cerrno>
+#include <cstring>
 #include <exiv2/exiv2.hpp>
 #include <fstream>
 #include <iterator>
 #include <random>
+#include <stdexcept>
 #include "xmp_sidecar_io_int.hpp"
 
 #ifdef EXV_ENABLE_FILESYSTEM
 #ifdef _WIN32
 #include <windows.h>
+
+#include <aclapi.h>
+#include <sddl.h>
 #else
 #include <fcntl.h>
 #include <sys/stat.h>
@@ -524,6 +530,338 @@ TEST_F(XmpFileWrite, PreservesPermissionsAndSymlinkAndDocumentsHardlinks) {
 #endif
 
 #ifdef _WIN32
+struct WindowsHandleDeleter {
+  void operator()(void* handle) const {
+    CloseHandle(handle);
+  }
+};
+using WindowsHandle = std::unique_ptr<void, WindowsHandleDeleter>;
+
+void requireWindows(BOOL result) {
+  if (!result) {
+    throw std::runtime_error("Windows security test setup failed: " + std::to_string(GetLastError()));
+  }
+}
+
+bool windowsAclsSupported(const fs::path& path) {
+  wchar_t volume[MAX_PATH];
+  DWORD flags = 0;
+  requireWindows(GetVolumePathNameW(path.c_str(), volume, MAX_PATH));
+  requireWindows(GetVolumeInformationW(volume, nullptr, 0, nullptr, nullptr, &flags, nullptr, 0));
+  return (flags & FILE_PERSISTENT_ACLS) != 0;
+}
+
+std::vector<byte> windowsSecurity(const fs::path& path) {
+  constexpr DWORD information = OWNER_SECURITY_INFORMATION | GROUP_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION;
+  DWORD size = 0;
+  GetFileSecurityW(path.c_str(), information, nullptr, 0, &size);
+  requireWindows(size != 0);
+  std::vector<byte> descriptor(size);
+  requireWindows(GetFileSecurityW(path.c_str(), information, descriptor.data(), size, &size));
+  return descriptor;
+}
+
+std::string windowsUserSid() {
+  HANDLE handle = nullptr;
+  requireWindows(OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &handle));
+  WindowsHandle token(handle);
+  DWORD size = 0;
+  GetTokenInformation(token.get(), TokenUser, nullptr, 0, &size);
+  std::vector<byte> user(size);
+  requireWindows(GetTokenInformation(token.get(), TokenUser, user.data(), size, &size));
+  LPSTR text = nullptr;
+  requireWindows(ConvertSidToStringSidA(reinterpret_cast<TOKEN_USER*>(user.data())->User.Sid, &text));
+  const std::string result(text);
+  LocalFree(text);
+  return result;
+}
+
+void setWindowsDacl(const fs::path& path, const std::string& sddl, bool protectedDacl = true) {
+  PSECURITY_DESCRIPTOR descriptor = nullptr;
+  requireWindows(
+      ConvertStringSecurityDescriptorToSecurityDescriptorA(sddl.c_str(), SDDL_REVISION_1, &descriptor, nullptr));
+  PACL acl = nullptr;
+  BOOL present = FALSE, defaulted = FALSE;
+  const auto valid = GetSecurityDescriptorDacl(descriptor, &present, &acl, &defaulted);
+  const auto error =
+      valid ? SetNamedSecurityInfoW(const_cast<wchar_t*>(path.c_str()), SE_FILE_OBJECT,
+                                    DACL_SECURITY_INFORMATION | (protectedDacl ? PROTECTED_DACL_SECURITY_INFORMATION
+                                                                               : UNPROTECTED_DACL_SECURITY_INFORMATION),
+                                    nullptr, nullptr, acl, nullptr)
+            : GetLastError();
+  LocalFree(descriptor);
+  SetLastError(error);
+  requireWindows(error == ERROR_SUCCESS);
+}
+
+WindowsHandle windowsRestrictedReader() {
+  HANDLE handle = nullptr;
+  requireWindows(OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY | TOKEN_DUPLICATE, &handle));
+  WindowsHandle token(handle);
+  byte world[SECURITY_MAX_SID_SIZE];
+  DWORD size = sizeof(world);
+  requireWindows(CreateWellKnownSid(WinWorldSid, nullptr, world, &size));
+  SID_AND_ATTRIBUTES restricting{world, 0};
+  requireWindows(
+      CreateRestrictedToken(token.get(), DISABLE_MAX_PRIVILEGE, 0, nullptr, 0, nullptr, 1, &restricting, &handle));
+  return WindowsHandle(handle);
+}
+
+WindowsHandle openWindowsProbe(const fs::path& path, HANDLE token, DWORD access, DWORD& error) {
+  requireWindows(ImpersonateLoggedOnUser(token));
+  const auto handle = CreateFileW(path.c_str(), access, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
+                                  OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+  error = handle == INVALID_HANDLE_VALUE ? GetLastError() : ERROR_SUCCESS;
+  requireWindows(RevertToSelf());
+  return WindowsHandle(handle == INVALID_HANDLE_VALUE ? nullptr : handle);
+}
+
+// Synchronize at the real create/write/replace boundaries, rather than racing a polling thread.
+struct WindowsSecurityProbe : Internal::XmpFileOps {
+  HANDLE token;
+  fs::path target;
+  std::vector<byte> expectedSecurity;
+  std::string expectedOldBytes;
+  mutable fs::path temporary;
+  mutable WindowsHandle retained;
+  mutable unsigned creations = 0, writes = 0, replacements = 0;
+
+  WindowsSecurityProbe(HANDLE reader, fs::path path) : token(reader), target(std::move(path)) {
+  }
+
+  int create(const fs::path& path, bool replacement) const override {
+    const int fd = XmpFileOps::create(path, replacement);
+    if (fd < 0) {
+      return fd;
+    }
+    temporary = path;
+    ++creations;
+    EXPECT_TRUE(replacement);
+    DWORD error = 0;
+    auto reader = openWindowsProbe(path, token, GENERIC_READ, error);
+    EXPECT_FALSE(reader);
+    EXPECT_EQ(ERROR_ACCESS_DENIED, error);
+    if (reader) {
+      retained = std::move(reader);
+    }
+    auto writer = openWindowsProbe(path, token, GENERIC_WRITE, error);
+    EXPECT_FALSE(writer);
+    EXPECT_EQ(ERROR_ACCESS_DENIED, error);
+    return fd;
+  }
+
+  size_t write(FILE* file, const byte* data, size_t size) const override {
+    ++writes;
+    DWORD error = 0;
+    const auto reader = openWindowsProbe(temporary, token, GENERIC_READ, error);
+    EXPECT_FALSE(reader);
+    EXPECT_EQ(ERROR_ACCESS_DENIED, error);
+    return XmpFileOps::write(file, data, size);
+  }
+
+  void replace(const fs::path& source, const fs::path& destination) const override {
+    ++replacements;
+    EXPECT_EQ(expectedSecurity, windowsSecurity(source));
+    EXPECT_EQ(expectedOldBytes, contents());
+    XmpFileOps::replace(source, destination);
+  }
+
+  std::string contents() const {
+    std::ifstream stream(target, std::ios::binary);
+    return {std::istreambuf_iterator<char>(stream), std::istreambuf_iterator<char>()};
+  }
+};
+
+TEST_F(XmpFileWrite, WindowsPreventsRetainedHandleLeak) {
+  if (!windowsAclsSupported(directory)) {
+    GTEST_SKIP() << "Filesystem does not support persistent Windows ACLs";
+  }
+  const auto sid = windowsUserSid();
+  setWindowsDacl(directory, "D:P(A;OICI;FA;;;" + sid + ")(A;OICI;GRGW;;;WD)");
+  seed();
+  setWindowsDacl(target, "D:P(A;;FA;;;" + sid + ")");
+  auto token = windowsRestrictedReader();
+  DWORD error = 0;
+  EXPECT_FALSE(openWindowsProbe(target, token.get(), GENERIC_READ, error));
+  ASSERT_EQ(ERROR_ACCESS_DENIED, error);
+  WindowsSecurityProbe ops(token.get(), target);
+  ops.expectedSecurity = windowsSecurity(target);
+  ops.expectedOldBytes = contents(target);
+  // Several chunks ensure that an empty temporary cannot become a readable packet later.
+  const std::string packet = "private packet" + std::string(20000, 'x');
+  MemIo source(reinterpret_cast<const byte*>(packet.data()), packet.size());
+  ASSERT_NO_THROW(Internal::replaceXmpFile(target.string(), source, ops));
+  ASSERT_EQ(1U, ops.creations);
+  EXPECT_GT(ops.writes, 1U);
+  EXPECT_EQ(1U, ops.replacements);
+  if (ops.retained) {
+    requireWindows(ImpersonateLoggedOnUser(token.get()));
+    std::string disclosed(packet.size(), '\0');
+    DWORD count = 0;
+    const auto read =
+        ReadFile(ops.retained.get(), disclosed.data(), static_cast<DWORD>(disclosed.size()), &count, nullptr);
+    requireWindows(RevertToSelf());
+    disclosed.resize(count);
+    EXPECT_FALSE(read && disclosed == packet)
+        << "A handle obtained before DACL restoration disclosed the complete packet";
+  }
+  EXPECT_EQ(packet, contents(target));
+  EXPECT_EQ(ops.expectedSecurity, windowsSecurity(target));
+  EXPECT_EQ(1U, files());
+}
+
+TEST_F(XmpFileWrite, WindowsPreservesDaclAndInheritanceAcrossWrites) {
+  if (!windowsAclsSupported(directory)) {
+    GTEST_SKIP() << "Filesystem does not support persistent Windows ACLs";
+  }
+  const auto sid = windowsUserSid();
+  setWindowsDacl(directory, "D:P(A;OICI;FA;;;" + sid + ")(A;OICI;GRGW;;;WD)");
+  auto token = windowsRestrictedReader();
+  for (const std::string mode : {"protected", "inherited", "legacy", "legacy-inherited", "mixed"}) {
+    SCOPED_TRACE(mode);
+    seed();
+    if (mode == "inherited" || mode == "legacy-inherited") {
+      setWindowsDacl(target, "D:", false);
+    } else {
+      setWindowsDacl(target, "D:P" + std::string(mode == "mixed" ? "(D;;GW;;;BG)" : "") + "(A;;FA;;;" + sid + ")" +
+                                 (mode == "mixed" ? "(A;;GR;;;S-1-5-21-0-0-0-12345)" : ""));
+    }
+    if (mode == "legacy" || mode == "legacy-inherited") {
+      auto descriptor = windowsSecurity(target);
+      requireWindows(SetFileSecurityW(target.c_str(), DACL_SECURITY_INFORMATION, descriptor.data()));
+    }
+    const auto original = windowsSecurity(target);
+    WindowsSecurityProbe ops(token.get(), target);
+    ops.expectedSecurity = original;
+    for (const auto* packet : {"first complete packet", "second complete packet"}) {
+      ops.expectedOldBytes = contents(target);
+      MemIo source(reinterpret_cast<const byte*>(packet), std::strlen(packet));
+      ASSERT_NO_THROW(Internal::replaceXmpFile(target.string(), source, ops));
+      EXPECT_EQ(packet, contents(target));
+      EXPECT_EQ(original, windowsSecurity(target));
+    }
+    EXPECT_EQ(2U, ops.creations);
+    EXPECT_EQ(2U, ops.replacements);
+    if (mode == "inherited") {
+      // Subsequent parent changes must affect the replacement like an untouched child.
+      const auto reference = directory / "reference";
+      std::ofstream(reference) << "reference";
+      setWindowsDacl(reference, "D:", false);
+      setWindowsDacl(directory, "D:P(A;OICI;FA;;;" + sid + ")");
+      EXPECT_EQ(windowsSecurity(reference), windowsSecurity(target));
+      fs::remove(reference);
+      setWindowsDacl(directory, "D:P(A;OICI;FA;;;" + sid + ")(A;OICI;GRGW;;;WD)");
+    }
+    EXPECT_EQ(1U, files());
+    fs::remove(target);
+  }
+}
+
+TEST_F(XmpFileWrite, WindowsNewFilesInheritDirectorySecurity) {
+  if (!windowsAclsSupported(directory)) {
+    GTEST_SKIP() << "Filesystem does not support persistent Windows ACLs";
+  }
+  setWindowsDacl(directory, "D:P(A;OICI;FA;;;" + windowsUserSid() + ")(A;OICI;GR;;;WD)");
+  const auto reference = directory / "reference";
+  std::ofstream(reference) << "reference";
+  auto image = deferred();
+  raw(*image, "new file");
+  image->writeMetadata();
+  EXPECT_EQ(windowsSecurity(reference), windowsSecurity(target));
+}
+
+TEST_F(XmpFileWrite, WindowsPreservesSecurityOnWriteCloseAndReplacementFailures) {
+  if (!windowsAclsSupported(directory)) {
+    GTEST_SKIP() << "Filesystem does not support persistent Windows ACLs";
+  }
+  const auto sid = windowsUserSid();
+  setWindowsDacl(directory, "D:P(A;OICI;FA;;;" + sid + ")(A;OICI;GRGW;;;WD)");
+  seed();
+  setWindowsDacl(target, "D:P(A;;FA;;;" + sid + ")");
+  const auto original = windowsSecurity(target);
+  for (const auto stage : {FailureOps::writeFailure, FailureOps::closeFailure, FailureOps::replaceFailure}) {
+    const std::string packet = "new packet";
+    MemIo source(reinterpret_cast<const byte*>(packet.data()), packet.size());
+    EXPECT_THROW(Internal::replaceXmpFile(target.string(), source, FailureOps(stage)), Error);
+    EXPECT_EQ("original-canary", contents(target));
+    EXPECT_EQ(original, windowsSecurity(target));
+    EXPECT_EQ(1U, files());
+  }
+  auto image = deferred();
+  raw(*image, "retry");
+  EXPECT_NO_THROW(image->writeMetadata());
+  EXPECT_EQ(original, windowsSecurity(target));
+}
+
+TEST_F(XmpFileWrite, WindowsSecurityErrorsPreserveDestinationAndAllowRetry) {
+  if (!windowsAclsSupported(directory)) {
+    GTEST_SKIP() << "Filesystem does not support persistent Windows ACLs";
+  }
+  const auto sid = windowsUserSid();
+  setWindowsDacl(directory, "D:P(A;OICI;FA;;;" + sid + ")(A;OICI;GRGW;;;WD)");
+  seed();
+  setWindowsDacl(target, "D:P(A;;FA;;;" + sid + ")");
+  const auto original = windowsSecurity(target);
+  struct FailSecurity : Internal::XmpFileOps {
+    bool omitRestoration;
+
+    explicit FailSecurity(bool omit) : omitRestoration(omit) {
+    }
+
+    void setSecurity(int, const fs::path&, const std::vector<byte>&) const override {
+      if (!omitRestoration) {
+        throw Error(ErrorCode::kerImageWriteFailed);
+      }
+      // Returning without installing the DACL must be caught by verification.
+    }
+  };
+  const std::string packet = "new private packet";
+  MemIo source(reinterpret_cast<const byte*>(packet.data()), packet.size());
+  for (const bool omit : {false, true}) {
+    EXPECT_THROW(Internal::replaceXmpFile(target.string(), source, FailSecurity(omit)), Error);
+    EXPECT_EQ("original-canary", contents(target));
+    EXPECT_EQ(original, windowsSecurity(target));
+    EXPECT_EQ(1U, files());
+  }
+  ASSERT_NO_THROW(Internal::replaceXmpFile(target.string(), source));
+  EXPECT_EQ(packet, contents(target));
+  EXPECT_EQ(original, windowsSecurity(target));
+  EXPECT_EQ(1U, files());
+}
+
+TEST_F(XmpFileWrite, WindowsPrivateCreationRejectsExistingTemporary) {
+  if (!windowsAclsSupported(directory)) {
+    GTEST_SKIP() << "Filesystem does not support persistent Windows ACLs";
+  }
+  seed();
+  const auto original = windowsSecurity(target);
+  EXPECT_EQ(-1, Internal::XmpFileOps{}.create(target, true));
+  EXPECT_EQ(EEXIST, errno);
+  EXPECT_EQ("original-canary", contents(target));
+  EXPECT_EQ(original, windowsSecurity(target));
+}
+
+TEST_F(XmpFileWrite, WindowsCleansPrivateTemporaryWithoutParentDeleteChild) {
+  if (!windowsAclsSupported(directory)) {
+    GTEST_SKIP() << "Filesystem does not support persistent Windows ACLs";
+  }
+  const auto sid = windowsUserSid();
+  // Full directory access except FILE_DELETE_CHILD. Cleanup needs DELETE on the temporary itself.
+  setWindowsDacl(directory, "D:P(A;OICI;0x1f01bf;;;" + sid + ")(A;OICI;GRGW;;;WD)");
+  seed();
+  setWindowsDacl(target, "D:P(A;;FA;;;" + sid + ")");
+  const auto original = windowsSecurity(target);
+  const std::string packet = "private packet";
+  MemIo source(reinterpret_cast<const byte*>(packet.data()), packet.size());
+  EXPECT_THROW(Internal::replaceXmpFile(target.string(), source, FailureOps(FailureOps::writeFailure)), Error);
+  EXPECT_EQ("original-canary", contents(target));
+  EXPECT_EQ(original, windowsSecurity(target));
+  EXPECT_EQ(1U, files());
+  ASSERT_NO_THROW(Internal::replaceXmpFile(target.string(), source));
+  EXPECT_EQ(packet, contents(target));
+  EXPECT_EQ(original, windowsSecurity(target));
+}
+
 // Windows must preserve the old file when sharing or read-only attributes deny replacement.
 TEST_F(XmpFileWrite, PreservesReadOnlyAndLockedDestinations) {
   seed();

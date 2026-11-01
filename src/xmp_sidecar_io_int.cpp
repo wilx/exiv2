@@ -5,11 +5,13 @@
 #include <array>
 #include <atomic>
 #include <cerrno>
+#include <cstring>
 #include <random>
 #include <vector>
 #include "error.hpp"
 
 #ifdef _WIN32
+#include <aclapi.h>
 #include <fcntl.h>
 #include <io.h>
 #include <sys/stat.h>
@@ -31,9 +33,15 @@ struct TemporaryFile {
   ~TemporaryFile() {
     if (file)
       std::fclose(file);
-    std::error_code ignored;
-    if (!path.empty())
+    if (!path.empty()) {
+#ifdef _WIN32
+      // Remove only the temporary file, never an unexpected directory.
+      DeleteFileW(path.c_str());
+#else
+      std::error_code ignored;
       fs::remove(path, ignored);
+#endif
+    }
   }
 };
 
@@ -80,24 +88,120 @@ void createTemporary(TemporaryFile& temp, const fs::path& target, bool replaceme
 }
 
 #ifdef _WIN32
-// Preserve permissions before commit, and respect an unwritable old file.
-void preservePermissions(const fs::path& target, const fs::path& temp) {
-  if (!fs::exists(target))
-    return;
-  if (!fs::is_regular_file(target))
+struct WindowsHandleDeleter {
+  void operator()(void* handle) const {
+    if (handle != INVALID_HANDLE_VALUE) {
+      CloseHandle(handle);
+    }
+  }
+};
+using WindowsHandle = std::unique_ptr<void, WindowsHandleDeleter>;
+
+struct WindowsSecurityDeleter {
+  void operator()(void* descriptor) const {
+    LocalFree(descriptor);
+  }
+};
+
+std::vector<byte> windowsSecurity(HANDLE handle) {
+  PSECURITY_DESCRIPTOR descriptor = nullptr;
+  const auto result = GetSecurityInfo(
+      handle, SE_FILE_OBJECT, OWNER_SECURITY_INFORMATION | GROUP_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+      nullptr, nullptr, nullptr, nullptr, &descriptor);
+  std::unique_ptr<void, WindowsSecurityDeleter> owner(descriptor);
+  if (result != ERROR_SUCCESS) {
     throw Error(ErrorCode::kerImageWriteFailed);
-  const auto attributes = GetFileAttributesW(target.c_str());
-  if (attributes == INVALID_FILE_ATTRIBUTES || (attributes & FILE_ATTRIBUTE_READONLY))
-    throw Error(ErrorCode::kerImageWriteFailed);
-  DWORD length = 0;
-  GetFileSecurityW(target.c_str(), DACL_SECURITY_INFORMATION, nullptr, 0, &length);
-  if (!length)
-    throw Error(ErrorCode::kerImageWriteFailed);
-  std::vector<byte> descriptor(length);
-  if (!GetFileSecurityW(target.c_str(), DACL_SECURITY_INFORMATION, descriptor.data(), length, &length) ||
-      !SetFileSecurityW(temp.c_str(), DACL_SECURITY_INFORMATION, descriptor.data()))
-    throw Error(ErrorCode::kerImageWriteFailed);
+  }
+  const auto* bytes = static_cast<const byte*>(descriptor);
+  return {bytes, bytes + GetSecurityDescriptorLength(descriptor)};
 }
+
+bool sameSid(PSID left, PSID right) {
+  return left && right ? EqualSid(left, right) != FALSE : left == right;
+}
+
+struct WindowsSecurity {
+  PSID owner = nullptr;
+  PSID group = nullptr;
+  PACL acl = nullptr;
+  SECURITY_DESCRIPTOR_CONTROL control{};
+
+  explicit WindowsSecurity(const std::vector<byte>& descriptor) {
+    auto* data = const_cast<byte*>(descriptor.data());
+    BOOL defaulted = FALSE, present = FALSE;
+    DWORD revision = 0;
+    if (!GetSecurityDescriptorOwner(data, &owner, &defaulted) ||
+        !GetSecurityDescriptorGroup(data, &group, &defaulted) ||
+        !GetSecurityDescriptorDacl(data, &present, &acl, &defaulted) ||
+        !GetSecurityDescriptorControl(data, &control, &revision)) {
+      throw Error(ErrorCode::kerImageWriteFailed);
+    }
+  }
+
+  bool matches(const WindowsSecurity& other) const {
+    constexpr auto inheritance =
+        SE_DACL_PRESENT | SE_DACL_PROTECTED | SE_DACL_AUTO_INHERITED | SE_DACL_AUTO_INHERIT_REQ;
+    if (!sameSid(owner, other.owner) || !sameSid(group, other.group) ||
+        (control & inheritance) != (other.control & inheritance)) {
+      return false;
+    }
+    if (!acl || !other.acl) {
+      return acl == other.acl;
+    }
+    if (acl->AclRevision != other.acl->AclRevision || acl->AceCount != other.acl->AceCount) {
+      return false;
+    }
+    // Compare complete ACEs in order, without depending on unused ACL padding.
+    for (DWORD index = 0; index != acl->AceCount; ++index) {
+      void* left = nullptr;
+      void* right = nullptr;
+      if (!GetAce(acl, index, &left) || !GetAce(other.acl, index, &right)) {
+        throw Error(ErrorCode::kerImageWriteFailed);
+      }
+      const auto size = static_cast<ACE_HEADER*>(left)->AceSize;
+      if (size != static_cast<ACE_HEADER*>(right)->AceSize || std::memcmp(left, right, size) != 0) {
+        return false;
+      }
+    }
+    return true;
+  }
+};
+
+// Snapshot before creating a replacement, then restore only after writing/flushing.
+struct FilePermissions {
+  bool exists = false;
+  std::vector<byte> descriptor;
+
+  explicit FilePermissions(const fs::path& target) {
+    if (!fs::exists(target)) {
+      return;
+    }
+    const auto attributes = GetFileAttributesW(target.c_str());
+    if (!fs::is_regular_file(target) || attributes == INVALID_FILE_ATTRIBUTES ||
+        (attributes & FILE_ATTRIBUTE_READONLY)) {
+      throw Error(ErrorCode::kerImageWriteFailed);
+    }
+    WindowsHandle original(CreateFileW(target.c_str(), READ_CONTROL,
+                                       FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
+                                       FILE_ATTRIBUTE_NORMAL, nullptr));
+    if (original.get() == INVALID_HANDLE_VALUE) {
+      throw Error(ErrorCode::kerImageWriteFailed);
+    }
+    descriptor = windowsSecurity(original.get());
+    exists = true;
+  }
+
+  void apply(int fd, const fs::path& path, const XmpFileOps& ops) const {
+    if (!exists) {
+      return;
+    }
+    ops.setSecurity(fd, path, descriptor);
+    const auto actual = windowsSecurity(reinterpret_cast<HANDLE>(_get_osfhandle(fd)));
+    if (!WindowsSecurity(descriptor).matches(WindowsSecurity(actual))) {
+      throw Error(ErrorCode::kerImageWriteFailed);
+    }
+  }
+};
 #else
 struct Descriptor {
   int fd;
@@ -190,7 +294,60 @@ struct FilePermissions {
 
 int XmpFileOps::create(const fs::path& path, [[maybe_unused]] bool replacement) const {
 #ifdef _WIN32
-  return _wopen(path.c_str(), _O_WRONLY | _O_CREAT | _O_EXCL | _O_BINARY, _S_IREAD | _S_IWRITE);
+  if (!replacement) {
+    return _wopen(path.c_str(), _O_WRONLY | _O_CREAT | _O_EXCL | _O_BINARY, _S_IREAD | _S_IWRITE);
+  }
+  // Grant access only to the effective creator. In particular, retain DELETE
+  // for cleanup even when the parent permits creation but not child deletion.
+  HANDLE tokenHandle = nullptr;
+  if (!OpenThreadToken(GetCurrentThread(), TOKEN_QUERY, TRUE, &tokenHandle)) {
+    if (GetLastError() != ERROR_NO_TOKEN || !OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &tokenHandle)) {
+      throw Error(ErrorCode::kerImageWriteFailed);
+    }
+  }
+  WindowsHandle token(tokenHandle);
+  DWORD size = 0;
+  GetTokenInformation(token.get(), TokenUser, nullptr, 0, &size);
+  if (!size) {
+    throw Error(ErrorCode::kerImageWriteFailed);
+  }
+  std::vector<byte> user(size);
+  if (!GetTokenInformation(token.get(), TokenUser, user.data(), size, &size)) {
+    throw Error(ErrorCode::kerImageWriteFailed);
+  }
+  const auto sid = reinterpret_cast<TOKEN_USER*>(user.data())->User.Sid;
+  size = static_cast<DWORD>(sizeof(ACL) + sizeof(ACCESS_ALLOWED_ACE) - sizeof(DWORD)) + GetLengthSid(sid);
+  std::vector<byte> aclBytes(size);
+  auto* acl = reinterpret_cast<ACL*>(aclBytes.data());
+  SECURITY_DESCRIPTOR descriptor{};
+  // Install a protected DACL in CreateFileW itself: changing it afterward leaves
+  // a window in which an unauthorized reader can retain a handle.
+  if (!InitializeAcl(acl, size, ACL_REVISION) || !AddAccessAllowedAce(acl, ACL_REVISION, FILE_ALL_ACCESS, sid) ||
+      !InitializeSecurityDescriptor(&descriptor, SECURITY_DESCRIPTOR_REVISION) ||
+      !SetSecurityDescriptorDacl(&descriptor, TRUE, acl, FALSE) ||
+      !SetSecurityDescriptorControl(&descriptor, SE_DACL_PROTECTED, SE_DACL_PROTECTED)) {
+    throw Error(ErrorCode::kerImageWriteFailed);
+  }
+  SECURITY_ATTRIBUTES attributes{sizeof(attributes), &descriptor, FALSE};
+  WindowsHandle handle(CreateFileW(path.c_str(), GENERIC_WRITE | READ_CONTROL | WRITE_DAC | WRITE_OWNER,
+                                   FILE_SHARE_READ | FILE_SHARE_WRITE, &attributes, CREATE_NEW, FILE_ATTRIBUTE_NORMAL,
+                                   nullptr));
+  if (handle.get() == INVALID_HANDLE_VALUE) {
+    const auto error = GetLastError();
+    if (error == ERROR_FILE_EXISTS || error == ERROR_ALREADY_EXISTS) {
+      errno = EEXIST;
+      return -1;
+    }
+    throw Error(ErrorCode::kerImageWriteFailed);
+  }
+  const int fd = _open_osfhandle(reinterpret_cast<intptr_t>(handle.get()), _O_WRONLY | _O_BINARY | _O_NOINHERIT);
+  if (fd < 0) {
+    handle.reset();
+    DeleteFileW(path.c_str());
+    throw Error(ErrorCode::kerImageWriteFailed);
+  }
+  handle.release();  // The CRT descriptor now owns the Windows handle.
+  return fd;
 #else
   // The returned descriptor remains writable even with mode 0000. Never give
   // another user a chance to retain a descriptor before permissions are copied.
@@ -198,7 +355,35 @@ int XmpFileOps::create(const fs::path& path, [[maybe_unused]] bool replacement) 
 #endif
 }
 
-#ifndef _WIN32
+#ifdef _WIN32
+void XmpFileOps::setSecurity(int fd, const fs::path& path, const std::vector<byte>& descriptor) const {
+  const auto handle = reinterpret_cast<HANDLE>(_get_osfhandle(fd));
+  const WindowsSecurity expected(descriptor);
+  const auto currentDescriptor = windowsSecurity(handle);
+  const WindowsSecurity current(currentDescriptor);
+  DWORD information =
+      DACL_SECURITY_INFORMATION | ((expected.control & SE_DACL_PROTECTED) ? PROTECTED_DACL_SECURITY_INFORMATION
+                                                                          : UNPROTECTED_DACL_SECURITY_INFORMATION);
+  if (!sameSid(expected.owner, current.owner)) {
+    information |= OWNER_SECURITY_INFORMATION;
+  }
+  if (!sameSid(expected.group, current.group)) {
+    information |= GROUP_SECURITY_INFORMATION;
+  }
+  if (expected.control & SE_DACL_AUTO_INHERITED) {
+    // Use the inheritance-aware API so inherited ACEs and the AI flag survive.
+    if (SetSecurityInfo(handle, SE_FILE_OBJECT, information, expected.owner, expected.group, expected.acl, nullptr) !=
+        ERROR_SUCCESS) {
+      throw Error(ErrorCode::kerImageWriteFailed);
+    }
+  } else {
+    // Preserve the legacy inheritance model when the original AI flag is clear.
+    if (!SetFileSecurityW(path.c_str(), information, const_cast<byte*>(descriptor.data()))) {
+      throw Error(ErrorCode::kerImageWriteFailed);
+    }
+  }
+}
+#else
 #ifdef EXV_HAVE_POSIX_ACL
 XmpAcl XmpFileOps::readAcl(int fd) const {
 #if defined(__FreeBSD__) || defined(__NetBSD__)
@@ -265,13 +450,12 @@ void replaceXmpFile(const std::string& path, BasicIo& source, const XmpFileOps& 
     const FilePermissions permissions(target, ops);
     const bool replacement = permissions.exists;
 #else
-    const bool replacement = fs::exists(target);
+    const FilePermissions permissions(target);
+    const bool replacement = permissions.exists;
 #endif
     TemporaryFile temp;
     createTemporary(temp, target, replacement, ops);
-#ifdef _WIN32
-    preservePermissions(target, temp.path);
-#else
+#ifndef _WIN32
     const bool copiedAcl = permissions.apply(fileno(temp.file), ops);
 #endif
     std::array<byte, 8192> buffer;
@@ -286,10 +470,12 @@ void replaceXmpFile(const std::string& path, BasicIo& source, const XmpFileOps& 
     }
     if (source.error() || total != expected)
       throw Error(ErrorCode::kerImageWriteFailed);
-#ifndef _WIN32
-    // Writes can clear special mode bits. Verify after flushing, before commit.
+    // Flush the complete packet before restoring security or verifying mode bits.
     if (std::fflush(temp.file) != 0)
       throw Error(ErrorCode::kerImageWriteFailed);
+#ifdef _WIN32
+    permissions.apply(_fileno(temp.file), temp.path, ops);
+#else
     permissions.verify(fileno(temp.file), ops, copiedAcl);
 #endif
     auto* file = temp.file;
