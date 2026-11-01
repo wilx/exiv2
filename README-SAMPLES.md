@@ -590,6 +590,34 @@ Read an XMP packet from a file, parse and re-serialize it.
 
 
 
+### Creating an XMP sidecar without overwriting it on failure
+
+The existing `ImageFactory::create(type, path)` creates or overwrites the file
+immediately. To defer that filesystem change until a successful metadata write,
+use the explicit XMP-only mode:
+
+```cpp
+auto sidecar = Exiv2::ImageFactory::create(
+    Exiv2::ImageType::xmp, path, Exiv2::CreateMode::deferred);
+sidecar->setExifData(source.exifData());
+sidecar->setIptcData(source.iptcData());
+sidecar->setXmpData(source.xmpData());
+sidecar->writeMetadata(); // May throw; handle the error in the calling application.
+```
+
+Before the first successful write, the object represents a new, empty sidecar.
+`good()` and `readMetadata()` work on that staged state; `io().path()` reports the
+intended destination. An old file remains unchanged, and a new file remains
+absent, even if the object is destroyed without writing. Filesystem errors may
+therefore occur at write time. Successful writing replaces the destination;
+use `open()` and `readMetadata()` when editing existing metadata instead.
+
+Applications such as digiKam can opt in by adding `CreateMode::deferred` to their
+XMP factory call, retaining their subsequent read/set/write sequence. Older
+Exiv2 versions still require application-managed temporary output. This overload
+does not add deferred support for `.exv` or other image formats. Invalid text is
+reported as an error; no encoding is guessed and no offending property is dropped.
+
 Robin Mills<br>
 robin@clanmills.com<br>
 Revised: 2021-09-21

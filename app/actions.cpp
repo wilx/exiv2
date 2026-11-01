@@ -1689,7 +1689,9 @@ int metacopy(const std::string& source, const std::string& tgt, Exiv2::ImageType
     targetImage = Exiv2::ImageFactory::open(target);
     targetImage->readMetadata();
   } else {
-    targetImage = Exiv2::ImageFactory::create(targetType, target);
+    targetImage = targetType == Exiv2::ImageType::xmp
+                      ? Exiv2::ImageFactory::create(targetType, target, Exiv2::CreateMode::deferred)
+                      : Exiv2::ImageFactory::create(targetType, target);
   }
 
   // Copy each type of metadata
