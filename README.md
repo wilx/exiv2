@@ -1128,7 +1128,7 @@ Update your system and install the build tools and dependencies (zlib, expat, gt
 
 ```bash
 $ sudo apt --yes update
-$ sudo apt install --yes build-essential ccache clang cmake git google-mock libbrotli-dev libcurl4-openssl-dev libexpat1-dev libgtest-dev libinih-dev libssh-dev libxml2-utils libz-dev python3 zlib1g-dev
+$ sudo apt install --yes build-essential ccache clang cmake git google-mock libacl1-dev libbrotli-dev libcurl4-openssl-dev libexpat1-dev libgtest-dev libinih-dev libssh-dev libxml2-utils libz-dev python3 zlib1g-dev
 ```
 
 For users of other platforms, the script <exiv2dir>/ci/install_dependencies.sh has code used to configure many platforms.  The code in that file is a useful guide to configuring your platform.

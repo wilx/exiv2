@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 #include <gtest/gtest.h>
+#include <algorithm>
 #include <exiv2/exiv2.hpp>
 #include <fstream>
 #include <iterator>
@@ -10,6 +11,7 @@
 #ifdef _WIN32
 #include <windows.h>
 #else
+#include <fcntl.h>
 #include <sys/stat.h>
 #include <unistd.h>
 #endif
@@ -291,6 +293,194 @@ TEST_F(XmpFileWrite, ReportsMissingParentAndKeepsDirectoryDestination) {
 
 // Replacement retains permissions and follows symlinks without deleting the link.
 #ifndef _WIN32
+#ifdef EXV_HAVE_POSIX_ACL
+std::string accessAcl(const fs::path& path) {
+  Internal::XmpAcl acl(acl_get_file(path.c_str(), ACL_TYPE_ACCESS));
+  if (!acl)
+    throw Error(ErrorCode::kerImageWriteFailed);
+  std::unique_ptr<char, Internal::XmpAclDeleter> text(acl_to_text(acl.get(), nullptr));
+  if (!text)
+    throw Error(ErrorCode::kerImageWriteFailed);
+  return text.get();
+}
+
+bool setAcl(const fs::path& path, const char* text, acl_type_t type = ACL_TYPE_ACCESS) {
+  Internal::XmpAcl acl(acl_from_text(text));
+  return acl && acl_set_file(path.c_str(), type, acl.get()) == 0;
+}
+
+bool extendedAclSupported(const fs::path& directory) {
+  const auto probe = directory / "acl-probe";
+  {
+    std::ofstream file(probe);
+  }
+  const bool supported = setAcl(probe, "u::rw-,u:12345:r--,g::---,m::r--,o::---");
+  const auto error = errno;
+  fs::remove(probe);
+  if (!supported && error != ENOTSUP && error != EOPNOTSUPP && error != ENOSYS && error != EINVAL)
+    throw Error(ErrorCode::kerImageWriteFailed);
+  return supported;
+}
+
+TEST_F(XmpFileWrite, PreservesCompleteAccessAclAndOwnership) {
+  if (!extendedAclSupported(directory))
+    GTEST_SKIP() << "Filesystem does not support POSIX access ACLs";
+  seed();
+  for (const auto* acl :
+       {"u::rw-,u:12345:r--,g::---,g:12346:rw-,m::r--,o::---", "u::rw-,u:12345:rw-,g::---,m::---,o::---"}) {
+    ASSERT_TRUE(setAcl(target, acl));
+    const auto before = accessAcl(target);
+    struct stat original{};
+    ASSERT_EQ(0, stat(target.c_str(), &original));
+    auto image = deferred();
+    raw(*image, "updated");
+    image->writeMetadata();
+    EXPECT_EQ(image->xmpPacket(), contents(target));
+    EXPECT_EQ(before, accessAcl(target));
+    struct stat updated{};
+    ASSERT_EQ(0, stat(target.c_str(), &updated));
+    EXPECT_EQ(original.st_uid, updated.st_uid);
+    EXPECT_EQ(original.st_gid, updated.st_gid);
+    EXPECT_EQ(original.st_mode, updated.st_mode);
+  }
+}
+
+TEST_F(XmpFileWrite, RemovesInheritedEntriesWhenOriginalHasOnlyModePermissions) {
+  if (!extendedAclSupported(directory))
+    GTEST_SKIP() << "Filesystem does not support POSIX access ACLs";
+  seed();
+  const auto before = accessAcl(target);
+  ASSERT_TRUE(setAcl(directory, "u::rwx,u:12345:rwx,g::---,m::rwx,o::---", ACL_TYPE_DEFAULT));
+  auto image = deferred();
+  raw(*image, "no inherited readers");
+  image->writeMetadata();
+  EXPECT_EQ(before, accessAcl(target));
+}
+
+TEST_F(XmpFileWrite, PreservesSecurityAndAllowsRetryAfterMetadataErrors) {
+  if (!extendedAclSupported(directory))
+    GTEST_SKIP() << "Filesystem does not support POSIX access ACLs";
+  struct FailSecurity : Internal::XmpFileOps {
+    enum Stage { reading, installing, mode, verification } stage;
+    explicit FailSecurity(Stage s) : stage(s) {
+    }
+    mutable unsigned reads = 0;
+    Internal::XmpAcl readAcl(int fd) const override {
+      if (stage == reading || (stage == verification && ++reads > 1))
+        throw Error(ErrorCode::kerImageWriteFailed);
+      return XmpFileOps::readAcl(fd);
+    }
+    bool writeAcl(int fd, const Internal::XmpAcl& acl) const override {
+      if (stage == installing)
+        throw Error(ErrorCode::kerImageWriteFailed);
+      return XmpFileOps::writeAcl(fd, acl);
+    }
+    void setMode(int fd, mode_t modeBits) const override {
+      if (stage == mode)
+        throw Error(ErrorCode::kerImageWriteFailed);
+      XmpFileOps::setMode(fd, modeBits);
+    }
+  };
+  for (const auto stage :
+       {FailSecurity::reading, FailSecurity::installing, FailSecurity::mode, FailSecurity::verification}) {
+    seed();
+    ASSERT_TRUE(setAcl(target, "u::rw-,u:12345:r--,g::---,m::r--,o::---"));
+    const auto before = accessAcl(target);
+    const auto mode = fs::status(target).permissions();
+    const std::string packet = "replacement";
+    MemIo source(reinterpret_cast<const byte*>(packet.data()), packet.size());
+    EXPECT_THROW(Internal::replaceXmpFile(target.string(), source, FailSecurity(stage)), Error);
+    EXPECT_EQ("original-canary", contents(target));
+    EXPECT_EQ(before, accessAcl(target));
+    EXPECT_EQ(mode, fs::status(target).permissions());
+    EXPECT_EQ(1U, files());
+    EXPECT_NO_THROW(Internal::replaceXmpFile(target.string(), source));
+    EXPECT_EQ(packet, contents(target));
+  }
+}
+
+TEST_F(XmpFileWrite, FallsBackToModeBitsWhenAclIsUnsupported) {
+  struct Unsupported : Internal::XmpFileOps {
+    bool reading;
+    explicit Unsupported(bool r) : reading(r) {
+    }
+    Internal::XmpAcl readAcl(int fd) const override {
+      return reading ? Internal::XmpAcl{} : XmpFileOps::readAcl(fd);
+    }
+    bool writeAcl(int, const Internal::XmpAcl&) const override {
+      return false;
+    }
+  };
+  for (const bool reading : {false, true}) {
+    seed();
+    fs::permissions(target, fs::perms::owner_read | fs::perms::owner_write);
+    const std::string packet = "fallback";
+    MemIo source(reinterpret_cast<const byte*>(packet.data()), packet.size());
+    EXPECT_NO_THROW(Internal::replaceXmpFile(target.string(), source, Unsupported(reading)));
+    EXPECT_EQ(packet, contents(target));
+    EXPECT_EQ(fs::perms::owner_read | fs::perms::owner_write, fs::status(target).permissions());
+  }
+}
+#endif
+
+TEST_F(XmpFileWrite, RestoresDifferentGroupAndPreservesOriginalIfChownFails) {
+  const auto count = getgroups(0, nullptr);
+  ASSERT_GE(count, 0);
+  std::vector<gid_t> groups(static_cast<size_t>(count));
+  ASSERT_GE(getgroups(static_cast<int>(groups.size()), groups.data()), 0);
+  const auto other = std::find_if(groups.begin(), groups.end(), [](gid_t group) { return group != getegid(); });
+  if (other == groups.end())
+    GTEST_SKIP() << "Requires a second supplementary group";
+  seed();
+  ASSERT_EQ(0, chown(target.c_str(), geteuid(), *other));
+  struct FailOwner : Internal::XmpFileOps {
+    void setOwner(int, uid_t, gid_t) const override {
+      throw Error(ErrorCode::kerImageWriteFailed);
+    }
+  } ops;
+  const std::string packet = "new group preserved";
+  MemIo source(reinterpret_cast<const byte*>(packet.data()), packet.size());
+  EXPECT_THROW(Internal::replaceXmpFile(target.string(), source, ops), Error);
+  EXPECT_EQ("original-canary", contents(target));
+  EXPECT_EQ(1U, files());
+  EXPECT_NO_THROW(Internal::replaceXmpFile(target.string(), source));
+  struct stat updated{};
+  ASSERT_EQ(0, stat(target.c_str(), &updated));
+  EXPECT_EQ(*other, updated.st_gid);
+  EXPECT_EQ(geteuid(), updated.st_uid);
+}
+
+TEST_F(XmpFileWrite, NewFilesUseNormalCreationPermissions) {
+  const auto reference = directory / "reference";
+  {
+    std::ofstream file(reference);
+  }
+  auto image = deferred();
+  raw(*image, "new");
+  image->writeMetadata();
+  EXPECT_EQ(fs::status(reference).permissions(), fs::status(target).permissions());
+#ifdef EXV_HAVE_POSIX_ACL
+  EXPECT_EQ(accessAcl(reference), accessAcl(target));
+#endif
+}
+
+#ifdef EXV_HAVE_POSIX_ACL
+TEST_F(XmpFileWrite, NewFilesInheritDefaultAcl) {
+  if (!extendedAclSupported(directory))
+    GTEST_SKIP() << "Filesystem does not support POSIX access ACLs";
+  const auto reference = directory / "reference";
+  ASSERT_TRUE(setAcl(directory, "u::rwx,u:12345:rwx,g::---,m::rwx,o::---", ACL_TYPE_DEFAULT));
+  {
+    std::ofstream file(reference);
+  }
+  auto image = deferred();
+  raw(*image, "inherited");
+  image->writeMetadata();
+  EXPECT_EQ(fs::status(reference).permissions(), fs::status(target).permissions());
+  EXPECT_EQ(accessAcl(reference), accessAcl(target));
+}
+#endif
+
 TEST_F(XmpFileWrite, CreatesReplacementsWithoutInitialAccess) {
   struct InspectCreation : Internal::XmpFileOps {
     mutable bool inspected = false;

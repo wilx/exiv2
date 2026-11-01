@@ -63,7 +63,7 @@ unit_tests = executable(
   'unit_tests',
   test_sources,
   cpp_args: t_args,
-  dependencies: [exiv2_dep, gtest_dep, net_dep],
+  dependencies: [exiv2_dep, gtest_dep, net_dep, acl_dep],
   include_directories: exiv2inc,
 )
 

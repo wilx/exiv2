@@ -79,13 +79,13 @@ void createTemporary(TemporaryFile& temp, const fs::path& target, bool replaceme
   throw Error(ErrorCode::kerImageWriteFailed);
 }
 
+#ifdef _WIN32
 // Preserve permissions before commit, and respect an unwritable old file.
 void preservePermissions(const fs::path& target, const fs::path& temp) {
   if (!fs::exists(target))
     return;
   if (!fs::is_regular_file(target))
     throw Error(ErrorCode::kerImageWriteFailed);
-#ifdef _WIN32
   const auto attributes = GetFileAttributesW(target.c_str());
   if (attributes == INVALID_FILE_ATTRIBUTES || (attributes & FILE_ATTRIBUTE_READONLY))
     throw Error(ErrorCode::kerImageWriteFailed);
@@ -97,12 +97,95 @@ void preservePermissions(const fs::path& target, const fs::path& temp) {
   if (!GetFileSecurityW(target.c_str(), DACL_SECURITY_INFORMATION, descriptor.data(), length, &length) ||
       !SetFileSecurityW(temp.c_str(), DACL_SECURITY_INFORMATION, descriptor.data()))
     throw Error(ErrorCode::kerImageWriteFailed);
-#else
-  if (::access(target.c_str(), W_OK) != 0)
-    throw Error(ErrorCode::kerImageWriteFailed);
-  fs::permissions(temp, fs::status(target).permissions());
-#endif
 }
+#else
+struct Descriptor {
+  int fd;
+  explicit Descriptor(int value) : fd(value) {
+  }
+  ~Descriptor() {
+    if (fd >= 0)
+      ::close(fd);
+  }
+  Descriptor(const Descriptor&) = delete;
+  Descriptor& operator=(const Descriptor&) = delete;
+};
+
+#ifdef EXV_HAVE_POSIX_ACL
+bool unsupportedAcl(int error) {
+  return error == ENOTSUP || error == EOPNOTSUPP || error == ENOSYS;
+}
+
+std::string aclText(const XmpAcl& acl) {
+  ssize_t length = 0;
+  std::unique_ptr<char, XmpAclDeleter> text(acl_to_text(acl.get(), &length));
+  if (!text || length < 0)
+    throw Error(ErrorCode::kerImageWriteFailed);
+  return {text.get(), static_cast<size_t>(length)};
+}
+#endif
+
+// Snapshot through one descriptor before creating a replacement inode.
+struct FilePermissions {
+  struct stat status{};
+  bool exists = false;
+#ifdef EXV_HAVE_POSIX_ACL
+  XmpAcl acl;
+#endif
+  FilePermissions(const fs::path& target, const XmpFileOps& ops) {
+    Descriptor original(::open(target.c_str(), O_RDONLY | O_NONBLOCK | O_CLOEXEC | O_NOFOLLOW));
+    if (original.fd < 0) {
+      if (errno == ENOENT)
+        return;
+      throw Error(ErrorCode::kerImageWriteFailed);
+    }
+    exists = true;
+    if (fstat(original.fd, &status) != 0 || !S_ISREG(status.st_mode) || ::access(target.c_str(), W_OK) != 0)
+      throw Error(ErrorCode::kerImageWriteFailed);
+#ifdef EXV_HAVE_POSIX_ACL
+    acl = ops.readAcl(original.fd);
+#else
+    (void)ops;
+#endif
+  }
+  bool apply(int fd, const XmpFileOps& ops) const {
+    if (!exists)
+      return false;
+    bool copiedAcl = false;
+    struct stat temp{};
+    if (fstat(fd, &temp) != 0)
+      throw Error(ErrorCode::kerImageWriteFailed);
+    if (temp.st_uid != status.st_uid || temp.st_gid != status.st_gid)
+      ops.setOwner(fd, status.st_uid, status.st_gid);
+#ifdef EXV_HAVE_POSIX_ACL
+    // Setting the complete ACL also sets its corresponding mode bits atomically.
+    // Never expose the mask as ordinary group access before installing the ACL.
+    if (acl)
+      copiedAcl = ops.writeAcl(fd, acl);
+#endif
+    ops.setMode(fd, status.st_mode & 07777);
+    verify(fd, ops, copiedAcl);
+    return copiedAcl;
+  }
+  void verify(int fd, const XmpFileOps& ops, [[maybe_unused]] bool copiedAcl) const {
+    if (!exists)
+      return;
+    struct stat temp{};
+    if (fstat(fd, &temp) != 0 || temp.st_uid != status.st_uid || temp.st_gid != status.st_gid ||
+        (temp.st_mode & 07777) != (status.st_mode & 07777))
+      throw Error(ErrorCode::kerImageWriteFailed);
+#ifdef EXV_HAVE_POSIX_ACL
+    if (copiedAcl) {
+      const auto actual = ops.readAcl(fd);
+      if (!actual || aclText(actual) != aclText(acl))
+        throw Error(ErrorCode::kerImageWriteFailed);
+    }
+#else
+    (void)ops;
+#endif
+  }
+};
+#endif
 }  // namespace
 
 int XmpFileOps::create(const fs::path& path, [[maybe_unused]] bool replacement) const {
@@ -114,6 +197,45 @@ int XmpFileOps::create(const fs::path& path, [[maybe_unused]] bool replacement) 
   return ::open(path.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, replacement ? 0000 : 0666);
 #endif
 }
+
+#ifndef _WIN32
+#ifdef EXV_HAVE_POSIX_ACL
+XmpAcl XmpFileOps::readAcl(int fd) const {
+#if defined(__FreeBSD__) || defined(__NetBSD__)
+#ifdef _PC_ACL_NFS4
+  errno = 0;
+  const auto nfs4 = fpathconf(fd, _PC_ACL_NFS4);
+  if (nfs4 > 0)
+    return {};  // This writer supports POSIX access ACLs, not NFSv4 ACLs.
+  if (nfs4 < 0 && errno != 0 && errno != EINVAL && !unsupportedAcl(errno))
+    throw Error(ErrorCode::kerImageWriteFailed);
+#endif
+#endif
+  XmpAcl acl(acl_get_fd(fd));
+  if (!acl && !unsupportedAcl(errno))
+    throw Error(ErrorCode::kerImageWriteFailed);
+  return acl;
+}
+
+bool XmpFileOps::writeAcl(int fd, const XmpAcl& acl) const {
+  if (acl_set_fd(fd, acl.get()) == 0)
+    return true;
+  if (unsupportedAcl(errno))
+    return false;
+  throw Error(ErrorCode::kerImageWriteFailed);
+}
+#endif
+
+void XmpFileOps::setOwner(int fd, uid_t owner, gid_t group) const {
+  if (fchown(fd, owner, group) != 0)
+    throw Error(ErrorCode::kerImageWriteFailed);
+}
+
+void XmpFileOps::setMode(int fd, mode_t mode) const {
+  if (fchmod(fd, mode) != 0)
+    throw Error(ErrorCode::kerImageWriteFailed);
+}
+#endif
 
 size_t XmpFileOps::write(FILE* file, const byte* data, size_t size) const {
   return std::fwrite(data, 1, size, file);
@@ -139,9 +261,19 @@ void replaceXmpFile(const std::string& path, BasicIo& source, const XmpFileOps& 
       throw Error(ErrorCode::kerImageWriteFailed);
     IoCloser sourceCloser(source);
     const auto target = destination(path);
+#ifndef _WIN32
+    const FilePermissions permissions(target, ops);
+    const bool replacement = permissions.exists;
+#else
+    const bool replacement = fs::exists(target);
+#endif
     TemporaryFile temp;
-    createTemporary(temp, target, fs::exists(target), ops);
+    createTemporary(temp, target, replacement, ops);
+#ifdef _WIN32
     preservePermissions(target, temp.path);
+#else
+    const bool copiedAcl = permissions.apply(fileno(temp.file), ops);
+#endif
     std::array<byte, 8192> buffer;
     const auto expected = source.size();
     size_t total = 0;
@@ -154,6 +286,12 @@ void replaceXmpFile(const std::string& path, BasicIo& source, const XmpFileOps& 
     }
     if (source.error() || total != expected)
       throw Error(ErrorCode::kerImageWriteFailed);
+#ifndef _WIN32
+    // Writes can clear special mode bits. Verify after flushing, before commit.
+    if (std::fflush(temp.file) != 0)
+      throw Error(ErrorCode::kerImageWriteFailed);
+    permissions.verify(fileno(temp.file), ops, copiedAcl);
+#endif
     auto* file = temp.file;
     temp.file = nullptr;
     if (ops.close(file) != 0)

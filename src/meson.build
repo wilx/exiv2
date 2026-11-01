@@ -77,14 +77,14 @@ exiv2int = static_library(
   'exiv2int',
   int_lib,
   cpp_args: '-DEXIV2API=',
-  dependencies: [fmt_dep, inih_dep, zlib_dep],
+  dependencies: [fmt_dep, inih_dep, zlib_dep, acl_dep],
   include_directories: libinc,
 )
 
 exiv2int_dep = declare_dependency(
   include_directories: libinc,
   link_with: exiv2int,
-  dependencies: [fmt_dep, inih_dep, zlib_dep],
+  dependencies: [fmt_dep, inih_dep, zlib_dep, acl_dep],
 )
 
 exiv2 = library(

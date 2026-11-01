@@ -27,6 +27,9 @@
 // Define if you have the std::format function.
 #cmakedefine EXV_HAVE_STD_FORMAT
 
+// ACL inspection and preservation for safe XMP filesystem replacement.
+#cmakedefine EXV_HAVE_POSIX_ACL
+
 // Define if you have the strerror_r function.
 #cmakedefine EXV_HAVE_STRERROR_R
 

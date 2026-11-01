@@ -56,6 +56,19 @@ cdata.set('EXV_PACKAGE_STRING', '@0@ @1@'.format(meson.project_name(), cdata.get
 cdata.set('EXV_HAVE_STRERROR_R', cpp.has_function('strerror_r'))
 cdata.set('EXV_HAVE_STD_FORMAT', cpp.has_header_symbol('format', 'std::format'))
 
+acl_dep = []
+if host_machine.system() == 'linux'
+  acl_dep = dependency('libacl', required: false)
+endif
+if host_machine.system() in ['linux', 'freebsd', 'netbsd']
+  have_posix_acl = cpp.links('''
+#include <sys/types.h>
+#include <sys/acl.h>
+int main(){ auto a=acl_get_fd(-1); auto t=acl_to_text(a,nullptr); acl_set_fd(-1,a); acl_free(a); acl_free(t); }
+''', dependencies: acl_dep)
+  cdata.set('EXV_HAVE_POSIX_ACL', have_posix_acl)
+endif
+
 cdata.set('EXV_ENABLE_BMFF', get_option('bmff'))
 cdata.set('EXV_HAVE_LENSDATA', get_option('lensdata'))
 cdata.set('EXV_ENABLE_VIDEO', get_option('video'))

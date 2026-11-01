@@ -27,7 +27,7 @@ jobs:
       - name: Install meson
         run: python3 -m pip install lxml meson ninja
       - name: Install dependencies
-        run: sudo apt install -y cmake libcurl4-openssl-dev libbrotli-dev libexpat-dev libfmt-dev libinih-dev libz-dev gettext
+        run: sudo apt install -y cmake libcurl4-openssl-dev libacl1-dev libbrotli-dev libexpat-dev libfmt-dev libinih-dev libz-dev gettext
       - name: Compile and Test
         run: |
           meson setup "${{github.workspace}}/build" -Dauto_features=${{matrix.deps}} -Dwarning_level=3
@@ -52,7 +52,7 @@ jobs:
           python3 -m pip install lxml meson ninja
       - name: Install dependencies
         run: |
-          sudo apt install -y libcurl4-openssl-dev libbrotli-dev libz-dev gettext
+          sudo apt install -y libcurl4-openssl-dev libacl1-dev libbrotli-dev libz-dev gettext
           sudo apt install -y libc++abi-${{matrix.cxx}}-dev libc++-${{matrix.cxx}}-dev
       - name: Compile and Test
         env:

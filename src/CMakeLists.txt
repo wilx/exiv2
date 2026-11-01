@@ -299,6 +299,13 @@ if(EXIV2_ENABLE_INIH)
   list(APPEND requires_private_list "INIReader")
 endif()
 
+if(EXV_HAVE_POSIX_ACL AND ACL_LIBRARY)
+  target_include_directories(exiv2lib_int PRIVATE ${ACL_INCLUDE_DIR})
+  target_include_directories(exiv2lib PRIVATE ${ACL_INCLUDE_DIR})
+  target_link_libraries(exiv2lib PRIVATE "$<BUILD_INTERFACE:${ACL_LIBRARY}>" "$<INSTALL_INTERFACE:acl>")
+  list(APPEND requires_private_list "libacl")
+endif()
+
 # Convert private lists to delimited strings
 list(SORT libs_private_list)
 string(REPLACE ";" " -l" libs_private_string "${libs_private_list}")

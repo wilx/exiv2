@@ -82,3 +82,8 @@ add_test(NAME unitTests COMMAND unit_tests)
 if(WIN32)
   target_link_libraries(unit_tests PRIVATE advapi32)
 endif()
+
+if(EXV_HAVE_POSIX_ACL AND ACL_LIBRARY)
+  target_include_directories(unit_tests PRIVATE ${ACL_INCLUDE_DIR})
+  target_link_libraries(unit_tests PRIVATE ${ACL_LIBRARY})
+endif()

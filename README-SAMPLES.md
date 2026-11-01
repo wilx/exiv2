@@ -612,6 +612,13 @@ absent, even if the object is destroyed without writing. Filesystem errors may
 therefore occur at write time. Successful writing replaces the destination;
 use `open()` and `readMetadata()` when editing existing metadata instead.
 
+On Unix, replacement retains ownership, mode bits and supported POSIX access
+ACLs. Linux builds use the optional `libacl` development package; BSD uses its
+native ACL API. Without ACL support, or for unsupported ACL types, replacement
+uses normal owner/group/other permissions. Errors reading or restoring a
+supported ACL, or inability to retain ownership, cause the write to fail while
+leaving the original intact. New files retain normal umask/default-ACL behavior.
+
 Applications such as digiKam can opt in by adding `CreateMode::deferred` to their
 XMP factory call, retaining their subsequent read/set/write sequence. Older
 Exiv2 versions still require application-managed temporary output. This overload

@@ -64,3 +64,9 @@ if( BUILD_WITH_CCACHE )
         set_property(GLOBAL PROPERTY RULE_LAUNCH_LINK ccache)
     endif()
 endif()
+
+# Linux provides the POSIX.1e ACL API in libacl; BSD provides it in libc.
+if(EXIV2_ENABLE_FILESYSTEM_ACCESS AND CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    find_path(ACL_INCLUDE_DIR sys/acl.h)
+    find_library(ACL_LIBRARY acl)
+endif()

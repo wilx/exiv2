@@ -47,8 +47,11 @@ class EXIV2API XmpSidecar : public Image {
     @note Standard filesystem outputs are replaced only after the complete packet
           has been written and closed successfully. Symlinks are followed; other
           hard links retain the previous file. Custom BasicIo implementations
-          retain their own transfer guarantees. This is not a power-loss or
-          concurrent-writer isolation guarantee.
+          retain their own transfer guarantees. Unix replacements preserve ownership
+          and POSIX access ACLs when supported. Unavailable ACL support or unsupported
+          ACL types use the owner/group/other mode bits instead; their ACLs are not
+          preserved. Other security-metadata errors leave the original unchanged.
+          This is not a power-loss or concurrent-writer isolation guarantee.
    */
   void writeMetadata() override;
   /*!
