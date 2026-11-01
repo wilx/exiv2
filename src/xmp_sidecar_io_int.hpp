@@ -13,6 +13,7 @@ namespace Exiv2::Internal {
 // Injectable operations keep filesystem failure tests deterministic and local.
 struct XmpFileOps {
   virtual ~XmpFileOps() = default;
+  virtual int create(const std::filesystem::path& path, bool replacement) const;
   virtual size_t write(FILE* file, const byte* data, size_t size) const;
   virtual int close(FILE* file) const;
   virtual void replace(const std::filesystem::path& source, const std::filesystem::path& target) const;

@@ -9,6 +9,9 @@
 #ifdef EXV_ENABLE_FILESYSTEM
 #ifdef _WIN32
 #include <windows.h>
+#else
+#include <sys/stat.h>
+#include <unistd.h>
 #endif
 namespace {
 using namespace Exiv2;
@@ -288,6 +291,31 @@ TEST_F(XmpFileWrite, ReportsMissingParentAndKeepsDirectoryDestination) {
 
 // Replacement retains permissions and follows symlinks without deleting the link.
 #ifndef _WIN32
+TEST_F(XmpFileWrite, CreatesReplacementsWithoutInitialAccess) {
+  struct InspectCreation : Internal::XmpFileOps {
+    mutable bool inspected = false;
+    int create(const fs::path& path, bool replacement) const override {
+      const int fd = XmpFileOps::create(path, replacement);
+      if (fd >= 0) {
+        struct stat st{};
+        EXPECT_EQ(0, fstat(fd, &st));
+        EXPECT_EQ(0U, st.st_mode & 0777U);
+        EXPECT_TRUE(replacement);
+        inspected = true;
+      }
+      return fd;
+    }
+  } ops;
+  seed();
+  fs::permissions(target, fs::perms::owner_read | fs::perms::owner_write);
+  const std::string packet = "private packet";
+  MemIo source(reinterpret_cast<const byte*>(packet.data()), packet.size());
+  Internal::replaceXmpFile(target.string(), source, ops);
+  EXPECT_TRUE(ops.inspected);
+  EXPECT_EQ(packet, contents(target));
+  EXPECT_EQ(fs::perms::owner_read | fs::perms::owner_write, fs::status(target).permissions());
+}
+
 TEST_F(XmpFileWrite, PreservesPermissionsAndSymlinkAndDocumentsHardlinks) {
   seed();
   fs::permissions(target, fs::perms::owner_read | fs::perms::owner_write);

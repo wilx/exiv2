@@ -50,17 +50,13 @@ fs::path destination(const std::string& name) {
 }
 
 // Create in the destination directory so replacement never crosses filesystems.
-void createTemporary(TemporaryFile& temp, const fs::path& target) {
+void createTemporary(TemporaryFile& temp, const fs::path& target, bool replacement, const XmpFileOps& ops) {
   static std::atomic<unsigned long> sequence{0};
   std::random_device random;
   for (unsigned attempt = 0; attempt != 100; ++attempt) {
     const auto candidate =
         target.parent_path() / (".exiv2-xmp-" + std::to_string(random()) + "-" + std::to_string(sequence++));
-#ifdef _WIN32
-    const int fd = _wopen(candidate.c_str(), _O_WRONLY | _O_CREAT | _O_EXCL | _O_BINARY, _S_IREAD | _S_IWRITE);
-#else
-    const int fd = ::open(candidate.c_str(), O_WRONLY | O_CREAT | O_EXCL, 0666);
-#endif
+    const int fd = ops.create(candidate, replacement);
     if (fd < 0) {
       if (errno == EEXIST)
         continue;
@@ -109,6 +105,16 @@ void preservePermissions(const fs::path& target, const fs::path& temp) {
 }
 }  // namespace
 
+int XmpFileOps::create(const fs::path& path, [[maybe_unused]] bool replacement) const {
+#ifdef _WIN32
+  return _wopen(path.c_str(), _O_WRONLY | _O_CREAT | _O_EXCL | _O_BINARY, _S_IREAD | _S_IWRITE);
+#else
+  // The returned descriptor remains writable even with mode 0000. Never give
+  // another user a chance to retain a descriptor before permissions are copied.
+  return ::open(path.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, replacement ? 0000 : 0666);
+#endif
+}
+
 size_t XmpFileOps::write(FILE* file, const byte* data, size_t size) const {
   return std::fwrite(data, 1, size, file);
 }
@@ -134,7 +140,7 @@ void replaceXmpFile(const std::string& path, BasicIo& source, const XmpFileOps& 
     IoCloser sourceCloser(source);
     const auto target = destination(path);
     TemporaryFile temp;
-    createTemporary(temp, target);
+    createTemporary(temp, target, fs::exists(target), ops);
     preservePermissions(target, temp.path);
     std::array<byte, 8192> buffer;
     const auto expected = source.size();
