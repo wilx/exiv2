@@ -61,10 +61,9 @@ cdata.set('EXV_HAVE_LENSDATA', get_option('lensdata'))
 cdata.set('EXV_ENABLE_VIDEO', get_option('video'))
 
 net_dep = []
-foreach d, os : {'procstat': 'freebsd', 'socket': 'sunos', 'ws2_32': 'windows'}
+foreach d, os : {'procstat': 'freebsd', 'socket': 'sunos', 'ws2_32': 'windows', 'advapi32': 'windows'}
   if host_machine.system() == os
     net_dep += cpp.find_library(d)
-    break
   endif
 endforeach
 

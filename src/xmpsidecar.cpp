@@ -13,8 +13,10 @@
 #include "utils.hpp"
 #include "value.hpp"
 #include "xmp_exiv2.hpp"
+#include "xmp_sidecar_io_int.hpp"
 
 #include <cstring>
+#include <typeinfo>
 
 #ifdef EXIV2_DEBUG_MESSAGES
 #include <iostream>
@@ -109,6 +111,7 @@ void XmpSidecar::writeMetadata() {
   }
   IoCloser closer(*io_);
 
+  auto packet = xmpPacket_;
   if (!writeXmpFromPacket()) {
     // #589 copy XMP tags
     Exiv2::XmpData copy;
@@ -149,7 +152,7 @@ void XmpSidecar::writeMetadata() {
       xmpData_[xmp.key()] = xmp.value();
     }
 
-    if (XmpParser::encode(xmpPacket_, xmpData_, XmpParser::omitPacketWrapper | XmpParser::useCompactFormat) > 1) {
+    if (XmpParser::encode(packet, xmpData_, XmpParser::omitPacketWrapper | XmpParser::useCompactFormat) > 1) {
 #ifndef SUPPRESS_WARNINGS
       EXV_ERROR << "Failed to encode XMP metadata.\n";
 #endif
@@ -157,19 +160,28 @@ void XmpSidecar::writeMetadata() {
       throw Error(ErrorCode::kerImageWriteFailed);
     }
   }
-  if (!xmpPacket_.empty()) {
-    if (!xmpPacket_.starts_with("<?xml")) {
-      xmpPacket_ = xmlHeader + xmpPacket_ + xmlFooter;
+  if (!packet.empty()) {
+    if (!packet.starts_with("<?xml") && !packet.starts_with("<?xpacket")) {
+      packet = xmlHeader + packet + xmlFooter;
     }
     MemIo tempIo;
 
     // Write XMP packet
-    if (tempIo.write(reinterpret_cast<const byte*>(xmpPacket_.data()), xmpPacket_.size()) != xmpPacket_.size())
+    if (tempIo.write(reinterpret_cast<const byte*>(packet.data()), packet.size()) != packet.size())
       throw Error(ErrorCode::kerImageWriteFailed);
     if (tempIo.error())
       throw Error(ErrorCode::kerImageWriteFailed);
-    io_->close();
-    io_->transfer(tempIo);  // may throw
+    if (io_->close() != 0)
+      throw Error(ErrorCode::kerImageWriteFailed);
+#ifdef EXV_ENABLE_FILESYSTEM
+    // Do not bypass transfer overrides on caller-supplied FileIo subclasses.
+    const auto* io = io_.get();
+    if (typeid(*io) == typeid(FileIo))
+      Internal::replaceXmpFile(io_->path(), tempIo);
+    else
+#endif
+      io_->transfer(tempIo);  // may throw
+    xmpPacket_.swap(packet);
   }
 }  // XmpSidecar::writeMetadata
 

@@ -12,6 +12,8 @@ add_library(
   cr2header_int.hpp
   crwimage_int.cpp
   crwimage_int.hpp
+  xmp_sidecar_io_int.cpp
+  xmp_sidecar_io_int.hpp
   devicesettings_int.cpp
   devicesettings_int.hpp
   fujimn_int.cpp
@@ -240,7 +242,7 @@ if(WIN32)
   # Since windows.h is included in some headers, we need to propagate this definition
   target_compile_definitions(exiv2lib PUBLIC WIN32_LEAN_AND_MEAN)
   set_target_properties(exiv2lib PROPERTIES DEBUG_POSTFIX d)
-  target_link_libraries(exiv2lib PRIVATE psapi ws2_32 shell32)
+  target_link_libraries(exiv2lib PRIVATE psapi ws2_32 shell32 advapi32)
 else()
   if(CMAKE_SYSTEM_NAME STREQUAL "FreeBSD")
     target_link_libraries(exiv2lib PRIVATE procstat)

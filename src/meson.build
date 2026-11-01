@@ -49,6 +49,7 @@ int_lib = files(
   'cr2header_int.cpp',
   'crwimage_int.cpp',
   'devicesettings_int.cpp',
+  'xmp_sidecar_io_int.cpp',
   'fujimn_int.cpp',
   'helper_functions.cpp',
   'image_int.cpp',

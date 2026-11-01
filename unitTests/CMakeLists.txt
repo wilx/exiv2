@@ -44,6 +44,7 @@ add_executable(
   test_xmp_lifecycle.cpp
   test_xmp_race_encode_decode.cpp
   test_xmp_concurrent_registry.cpp
+  test_xmp_sidecar_io.cpp
   test_xmpsidecar.cpp
   unittest_utils.hpp
   unittest_utils.cpp
@@ -77,3 +78,7 @@ if(MSVC)
 endif()
 
 add_test(NAME unitTests COMMAND unit_tests)
+
+if(WIN32)
+  target_link_libraries(unit_tests PRIVATE advapi32)
+endif()

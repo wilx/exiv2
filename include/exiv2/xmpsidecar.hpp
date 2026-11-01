@@ -44,6 +44,11 @@ class EXIV2API XmpSidecar : public Image {
     @brief Write buffered metadata as an XMP sidecar.
     @throw Error(ErrorCode::kerImageWriteFailed) if structured XMP encoding fails.
            Encoding failure leaves the bytes present before this call unchanged.
+    @note Standard filesystem outputs are replaced only after the complete packet
+          has been written and closed successfully. Symlinks are followed; other
+          hard links retain the previous file. Custom BasicIo implementations
+          retain their own transfer guarantees. This is not a power-loss or
+          concurrent-writer isolation guarantee.
    */
   void writeMetadata() override;
   /*!
